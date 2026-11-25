@@ -12,7 +12,7 @@ import '@fontsource/cormorant-garamond/500.css';
 import '@fontsource/jost/300.css';
 import '@fontsource/jost/400.css';
 import '@fontsource/jost/500.css';
-import { buildTextParticles, SEQUENCE } from './text.js';
+import { buildTextParticles, SEQUENCE, MAX_TEXT_LEN } from './text.js';
 
 /* ------------------------------------------------------------------ */
 /*  Config                                                             */
@@ -54,6 +54,10 @@ const morphBtn = document.getElementById('morphBtn');
 const immersiveBtn = document.getElementById('immersiveBtn');
 const enterGestureBtn = document.getElementById('enterGesture');
 const enterQuietBtn = document.getElementById('enterQuiet');
+const composerEl = document.getElementById('composer');
+const textInput = document.getElementById('textInput');
+const textSendBtn = document.getElementById('textSend');
+const textCount = document.getElementById('textCount');
 
 function setStatus(text, tone = 'idle') {
   statusText.textContent = text;
@@ -166,7 +170,7 @@ canvas.addEventListener(
 
 let textTimerHandle = 0;
 
-setAssembled = function (next, announce = true) {
+setAssembled = function (next, announce = true, withText = true) {
   assembled = next;
   targetProgress = next ? 1 : 0;
   morphBtn.textContent = next ? '散作星尘' : '聚合成树';
@@ -174,11 +178,11 @@ setAssembled = function (next, announce = true) {
   if (announce && !gesture.active) {
     setStatus(next ? '聚合完成 · 静赏此刻' : '星屑散开 · 轻触聚合', next ? 'ok' : 'idle');
   }
-  // opt6: tree assembled → schedule letter sequence
+  // opt6: tree assembled → replay the letter sequence
   clearTimeout(textTimerHandle);
-  if (next && engine) {
+  if (next && withText && engine) {
     textTimerHandle = setTimeout(() => {
-      if (assembled && engine.beginTextSequence) engine.beginTextSequence();
+      if (assembled && engine.playText) engine.playText();
     }, SEQUENCE.assembleDelayMs);
   }
 };
@@ -212,6 +216,37 @@ function enter(withGesture) {
 }
 
 morphBtn.addEventListener('click', () => setAssembled(!assembled));
+
+/* ---- custom text → particle showcase ---- */
+function submitText() {
+  const raw = [...(textInput.value || '')].slice(0, MAX_TEXT_LEN).join('').trim();
+  if (!raw) {
+    toast('先写一句想展示的话，最多 8 个字');
+    textInput.focus();
+    return;
+  }
+  if (!engine) {
+    toast('当前浏览器未启用 WebGL，文字粒子不可用');
+    return;
+  }
+  if (!entered) enter(false);
+  if (!assembled) setAssembled(true, false, false);
+  engine.playText(raw);
+  setStatus(`文字 ·「${raw}」正在逐字聚成`, 'ok');
+}
+
+composerEl?.addEventListener('submit', (e) => {
+  e.preventDefault();
+  submitText();
+});
+
+textInput?.addEventListener('input', () => {
+  const chars = [...textInput.value];
+  if (chars.length > MAX_TEXT_LEN) {
+    textInput.value = chars.slice(0, MAX_TEXT_LEN).join('');
+  }
+  textCount.textContent = `${[...textInput.value].length}/${MAX_TEXT_LEN}`;
+});
 
 immersiveBtn.addEventListener('click', () =>
   setImmersive(!document.body.classList.contains('is-immersive'))
@@ -259,7 +294,7 @@ const gesture = {
   candidate: '',
   candidateCount: 0,
   stable: '',
-  palm: { x: 0.5, y: 0.5, ready: false, area: 0, areaPrev: 0, areaDelta: 0, steadyMs: 0 },
+  palm: { x: 0.5, y: 0.5, ready: false, spanSlow: 0, spanFast: 0 },
   // distance tracking — area-based zoom, near→close→enlarge / far→shrink
   zoomAcc: 0,
   zoomBaseDist: BASE_DIST,
@@ -286,10 +321,8 @@ function resetHand() {
   gesture.stable = '';
   gesture.zoomAcc = 0;
   gesture.palm.ready = false;
-  gesture.palm.area = 0;
-  gesture.palm.areaPrev = 0;
-  gesture.palm.areaDelta = 0;
-  gesture.palm.steadyMs = 0;
+  gesture.palm.spanSlow = 0;
+  gesture.palm.spanFast = 0;
 }
 
 function updateHandPresence(present) {
@@ -337,46 +370,45 @@ function processResult(result, frameMs = performance.now()) {
 
   const lm = hands[0];
 
-  // --- Palm area-based zooming (opt2): near = enlarge / far = shrink ---
-  // Shoelace area over the 21 hand landmarks
-  let area = 0;
-  for (let i = 0; i < lm.length; i++) {
-    const a = lm[i];
-    const b = lm[(i + 1) % lm.length];
-    area += a.x * b.y - b.x * a.y;
+  // --- 手掌离镜头远近 → 缩放（任意手势都生效，握拳时同样有效）---
+  // 取 21 个关键点的包围盒对角线作为「手掌尺度」：手靠近镜头 → 尺度变大 → 缩小画面；
+  // 手远离镜头 → 尺度变小 → 放大画面。
+  let minX = 1;
+  let maxX = 0;
+  let minY = 1;
+  let maxY = 0;
+  for (const p of lm) {
+    if (p.x < minX) minX = p.x;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.y > maxY) maxY = p.y;
   }
-  area = Math.abs(area) * 0.5;
+  const span = Math.hypot(maxX - minX, maxY - minY);
 
-  if (gesture.palm.area > 0) {
-    const delta = area - gesture.palm.area;
-    // Exponential accumulator — smooths jitter
-    gesture.palm.areaDelta = delta * 0.6 + gesture.palm.areaDelta * 0.4;
+  if (gesture.palm.spanSlow > 0) {
+    // 慢速基准 vs 快速跟随，比值反映“变大/变小”的趋势
+    gesture.palm.spanSlow += (span - gesture.palm.spanSlow) * 0.03;
+    gesture.palm.spanFast += (span - gesture.palm.spanFast) * 0.4;
 
-    // Stability gate: only count zoom when the hand is fairly still.
-    // Track recent center-of-mass velocity.
-    let cx = 0, cy = 0;
-    for (const p of lm) { cx += p.x; cy += p.y; }
-    cx /= lm.length; cy /= lm.length;
-    const dxAbs = Math.abs(cx - gesture.palm.x);
-    const dyAbs = Math.abs(cy - gesture.palm.y);
-    const speed = dxAbs + dyAbs;
+    const ratio = gesture.palm.spanFast / gesture.palm.spanSlow;
+    const DEAD = 0.06; // 死区：幅度不足 6% 视为手抖，不做缩放
+    const GAIN = 240;
 
-    if (speed < 0.004) gesture.palm.steadyMs += 32; else gesture.palm.steadyMs = 0;
-
-    // Hard threshold: ignore tiny movements
-    const relDelta = Math.abs(gesture.palm.areaDelta) / gesture.palm.area;
-    if (relDelta > 0.055 && gesture.palm.steadyMs > 150) {
-      // area ↑ → hand near → camera closer → distTarget ↓ (enlarge frame)
-      // area ↓ → hand far → camera away  → distTarget ↑ (shrink frame)
-      const K = 140; // sensitivity
-      distTarget = clamp(distTarget - gesture.palm.areaDelta * K, 34, 105);
-      setStatus('手势 · 前后移动 — 调整远近', 'live');
+    if (ratio > 1 + DEAD) {
+      // 手掌变大 = 靠近镜头 → 缩小
+      distTarget = clamp(distTarget + (ratio - 1 - DEAD) * GAIN, 34, 108);
+      setStatus('手势 · 靠近镜头 — 缩小', 'live');
+    } else if (ratio < 1 - DEAD) {
+      // 手掌变小 = 远离镜头 → 放大
+      distTarget = clamp(distTarget - (1 - ratio - DEAD) * GAIN, 34, 108);
+      setStatus('手势 · 远离镜头 — 放大', 'live');
     }
+  } else {
+    gesture.palm.spanSlow = span;
+    gesture.palm.spanFast = span;
   }
-  gesture.palm.area = area;
-  gesture.palm.areaPrev = area;
 
-  // --- Palm position → orbit rotation ---
+  // --- 掌心位置 → 旋转视角 ---
   const nx = 1 - lm[9].x;
   const ny = lm[9].y;
   if (!gesture.palm.ready) {
@@ -782,11 +814,13 @@ function createEngine() {
       uTime: { value: 0 },
       uProgress: { value: 0 },
       uDpr: { value: DPR },
+      uDim: { value: 1 },
     },
     vertexShader: /* glsl */ `
       uniform float uTime;
       uniform float uProgress;
       uniform float uDpr;
+      uniform float uDim;
       attribute vec3 aChaos;
       attribute float aSize;
       attribute float aSeed;
@@ -819,7 +853,7 @@ function createEngine() {
         gl_PointSize = aSize * uDpr * (1.12 - 0.12 * t) * (135.0 / -mvPosition.z);
 
         vColor = aColor * twinkle * 0.84;
-        vAlpha = mix(0.46, 0.68, t);
+        vAlpha = mix(0.46, 0.68, t) * uDim;
       }
     `,
     fragmentShader: /* glsl */ `
@@ -844,11 +878,13 @@ function createEngine() {
       uTime: { value: 0 },
       uProgress: { value: 0 },
       uDpr: { value: DPR },
+      uDim: { value: 1 },
     },
     vertexShader: /* glsl */ `
       uniform float uTime;
       uniform float uProgress;
       uniform float uDpr;
+      uniform float uDim;
       attribute vec3 aChaos;
       attribute float aSize;
       attribute float aSeed;
@@ -871,7 +907,7 @@ function createEngine() {
         gl_PointSize = aSize * uDpr * (0.85 + 0.15 * t) * pulse * (135.0 / -mvPosition.z);
 
         vColor = aColor * (0.55 + 0.6 * pulse);
-        vAlpha = mix(0.55, 0.78, t) * (0.5 + 0.5 * pulse);
+        vAlpha = mix(0.55, 0.78, t) * (0.5 + 0.5 * pulse) * uDim;
       }
     `,
     fragmentShader: /* glsl */ `
@@ -1243,56 +1279,85 @@ function createEngine() {
   scene.add(sky);
 
   /* ---- text particle overlay (opt6) ---- */
-  const textData = buildTextParticles(IS_MOBILE ? '圣诞快乐' : '圣诞快乐', {
-    fontSize: IS_MOBILE ? 24 : 34,
-    letterGap: 1.15,
-    centerY: -TREE.height / 2 - 5.4,
-    centerZ: 2.4,
-  });
+  const DEFAULT_TEXT = '圣诞快乐';
+  let textData = { group: new THREE.Group(), items: [] };
   scene.add(textData.group);
-  const letterProgresses = textData.progresses;
+
+  function disposeText() {
+    scene.remove(textData.group);
+    textData.group.traverse((o) => {
+      if (o.geometry) o.geometry.dispose();
+      if (o.material) o.material.dispose();
+    });
+    textData = { group: new THREE.Group(), items: [] };
+  }
+
+  function buildText(text) {
+    disposeText();
+    textData = buildTextParticles(text, {
+      fontPx: IS_MOBILE ? 32 : 44,
+      scale: IS_MOBILE ? 0.1 : 0.118,
+      letterGap: 0.22,
+      centerY: IS_MOBILE ? 0.6 : 1.1,
+      centerZ: 17,
+    });
+    scene.add(textData.group);
+  }
+
+  buildText(DEFAULT_TEXT);
 
   /* ---- letter-sequence scheduler (opt6) ---- */
-  let letterTimer = 0;
-  let letterStepTimer = 0;
-  let letterState = 'idle';    // 'idle' | 'assembling' | 'holding' | 'dispersing'
-  let letterIndex = 0;
+  let textState = 'idle'; // 'waiting' | 'in' | 'hold' | 'out'
+  let textIndex = 0;
+  let textClock = 0;
+  let textDelay = 0;
 
-  function beginTextSequence() {
-    if (letterState === 'assembling') return;
-    // 清除旧的并从头开始
-    for (let i = 0; i < letterProgresses.length; i++) letterProgresses[i] = 0;
-    letterIndex = 0;
-    letterState = 'assembling';
-    clearTimeout(letterTimer);
-    clearTimeout(letterStepTimer);
-    letterStepTimer = setTimeout(stepLetter, 60);
+  function playText(text) {
+    if (typeof text === 'string' && text.trim()) buildText(text.trim());
+    textIndex = 0;
+    textClock = 0;
+    textDelay = 0.35;
+    textState = 'waiting';
   }
-  function stepLetter() {
-    if (letterState !== 'assembling') return;
-    // 下一个字开始 lerp 到 1
-    if (letterIndex < letterProgresses.length && textData.group.children[letterIndex]) {
-      letterProgresses[letterIndex] = 0.01; // 标记已激活，animate 里平滑推进
-      letterIndex++;
-      letterStepTimer = setTimeout(stepLetter, SEQUENCE.perLetterInMs);
-    } else {
-      letterState = 'holding';
-      letterTimer = setTimeout(beginTextDisperse, SEQUENCE.holdMs);
-    }
-  }
-  function beginTextDisperse() {
-    letterState = 'dispersing';
-    clearTimeout(letterStepTimer);
-  }
-  function stepLetterOut(dt) {
-    // animate 里调：每个已激活字 lerp 回 0
-    for (let i = 0; i < letterProgresses.length; i++) {
-      if (letterProgresses[i] > 0) {
-        letterProgresses[i] = Math.max(0, letterProgresses[i] - dt * 3.0);
+
+  function tickText(dt) {
+    if (textState === 'waiting') {
+      textDelay -= dt;
+      if (textDelay <= 0) {
+        textState = 'in';
+        textClock = 0;
       }
+    } else if (textState === 'in') {
+      textClock += dt;
+      const want = Math.min(
+        textData.items.length,
+        Math.floor((textClock * 1000) / SEQUENCE.perLetterInMs) + 1
+      );
+      while (textIndex < want) {
+        textData.items[textIndex].progress = Math.max(textData.items[textIndex].progress, 0.001);
+        textIndex++;
+      }
+      let allIn = textIndex >= textData.items.length;
+      for (let i = 0; i < textIndex; i++) {
+        const it = textData.items[i];
+        it.progress = Math.min(1, it.progress + dt * SEQUENCE.letterInSpeed);
+        if (it.progress < 0.999) allIn = false;
+      }
+      if (allIn) {
+        textState = 'hold';
+        textClock = 0;
+      }
+    } else if (textState === 'hold') {
+      textClock += dt;
+      if (textClock * 1000 >= SEQUENCE.holdMs) textState = 'out';
+    } else if (textState === 'out') {
+      let allOut = true;
+      for (const it of textData.items) {
+        it.progress = Math.max(0, it.progress - dt * SEQUENCE.letterOutSpeed);
+        if (it.progress > 0) allOut = false;
+      }
+      if (allOut) textState = 'idle';
     }
-    const allDone = letterProgresses.every((v) => v <= 0);
-    if (allDone) letterState = 'idle';
   }
 
   /* ---- loop ----------------------------------------------------- */
@@ -1349,29 +1414,28 @@ function createEngine() {
     backdropHalo.material.opacity = 0.09 + progress * 0.09;
 
     // ---- text letter progress (opt6) ----
-    if (letterState === 'assembling') {
-      for (let i = 0; i < letterProgresses.length; i++) {
-        if (letterProgresses[i] > 0 && letterProgresses[i] < 1) {
-          letterProgresses[i] = Math.min(1, letterProgresses[i] + dt * 1.8);
-        }
-      }
-    } else if (letterState === 'dispersing') {
-      stepLetterOut(dt);
+    tickText(dt);
+    let textAlive = false;
+    let maxProg = 0;
+    for (const it of textData.items) {
+      it.material.uniforms.uTime.value = t;
+      it.material.uniforms.uProgress.value = it.progress;
+      it.material.uniforms.uDpr.value = DPR;
+      if (it.progress > maxProg) maxProg = it.progress;
+      if (it.progress > 0.005) textAlive = true;
     }
-    for (let i = 0; i < textData.group.children.length; i++) {
-      const p = textData.group.children[i];
-      if (p?.material?.uniforms) {
-        p.material.uniforms.uTime.value = t;
-        p.material.uniforms.uProgress.value = letterProgresses[i] ?? 0;
-        p.material.uniforms.uDpr.value = DPR;
-      }
-    }
-    // 文本跟随树的旋转，且完全消失时整体隐藏避免浪费 GPU
-    const textAlive = letterProgresses.some((v) => v > 0.01);
+    if (textData.veil) textData.veil.material.opacity = Math.min(1, maxProg) * 0.95;
+    // 文字展示时轻压树身并收敛辉光，让文字成为视觉焦点
+    const focus = Math.min(1, maxProg);
+    const dim = 1 - focus * 0.28;
+    foliageMat.uniforms.uDim.value = dim;
+    lightsMat.uniforms.uDim.value = dim;
+    bloom.strength = 0.6 - focus * 0.24;
     textData.group.visible = textAlive;
     if (textAlive) {
-      textData.group.rotation.y = yaw;
-      textData.group.rotation.x = pitch * 0.6;
+      // 文字始终朝向镜头，只做极轻微呼吸摆动，保证任何视角都读得清
+      textData.group.rotation.y = Math.sin(t * 0.35) * 0.05;
+      textData.group.rotation.x = Math.sin(t * 0.27) * 0.02;
     }
 
     composer.render();
@@ -1389,7 +1453,7 @@ function createEngine() {
 
   renderer.setAnimationLoop(animate);
 
-  return { resize, beginTextSequence };
+  return { resize, playText };
 }
 
 /* ------------------------------------------------------------------ */

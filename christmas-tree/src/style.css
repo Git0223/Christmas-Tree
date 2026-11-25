@@ -506,12 +506,101 @@ body.is-live .legend {
   background: rgba(85, 199, 154, 0.08);
 }
 
+/* ---------- Text composer (opt6) ---------- */
+
+.composer {
+  position: fixed;
+  left: 50%;
+  bottom: clamp(84px, 12vh, 112px);
+  transform: translate(-50%, 12px);
+  z-index: 9;
+  width: min(92vw, 430px);
+  padding: 12px 14px 13px;
+  border: 1px solid rgba(217, 184, 119, 0.2);
+  border-radius: 4px;
+  background: rgba(5, 12, 11, 0.62);
+  backdrop-filter: blur(16px) saturate(1.15);
+  -webkit-backdrop-filter: blur(16px) saturate(1.15);
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity 0.8s ease 0.4s,
+    transform 0.8s cubic-bezier(0.16, 1, 0.3, 1) 0.4s;
+}
+
+body.is-live .composer {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translate(-50%, 0);
+}
+
+body.is-immersive .composer,
+body.no-webgl .composer {
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+.composer__label {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 8.5px;
+  letter-spacing: 0.26em;
+  color: var(--gold-dim);
+}
+
+.composer__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.composer__input {
+  flex: 1;
+  min-width: 0;
+  height: 38px;
+  padding: 0 13px;
+  border: 1px solid rgba(244, 236, 221, 0.16);
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.3);
+  color: var(--cream);
+  font-family: var(--serif-cn);
+  font-size: 13px;
+  letter-spacing: 0.12em;
+  outline: none;
+  transition: border-color 0.3s ease, background-color 0.3s ease;
+}
+
+.composer__input::placeholder {
+  color: rgba(244, 236, 221, 0.26);
+  letter-spacing: 0.06em;
+}
+
+.composer__input:focus {
+  border-color: rgba(217, 184, 119, 0.55);
+  background: rgba(0, 0, 0, 0.42);
+}
+
+.composer__count {
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  color: rgba(244, 236, 221, 0.32);
+  font-variant-numeric: tabular-nums;
+  flex: none;
+}
+
+.composer__send {
+  flex: none;
+  padding: 10px 17px;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+}
+
 /* ---------- Toast ---------- */
 
 .toast {
   position: fixed;
   left: 50%;
-  bottom: 108px;
+  bottom: 212px;
   transform: translate(-50%, 10px);
   z-index: 12;
   padding: 12px 22px;
@@ -827,8 +916,21 @@ body.is-immersive .vignette {
   .hud--bottom {
     padding-bottom: calc(16px + env(safe-area-inset-bottom, 0px));
   }
+  .composer {
+    bottom: calc(78px + env(safe-area-inset-bottom, 0px));
+    width: min(94vw, 400px);
+    padding: 10px 12px 11px;
+  }
+  .composer__input {
+    height: 36px;
+    font-size: 12.5px;
+  }
+  .composer__send {
+    padding: 9px 13px;
+    font-size: 9.5px;
+  }
   .toast {
-    bottom: 88px;
+    bottom: calc(196px + env(safe-area-inset-bottom, 0px));
   }
 }
 
