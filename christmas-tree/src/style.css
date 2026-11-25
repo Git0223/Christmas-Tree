@@ -321,10 +321,10 @@ body.is-live .preview {
   transform: scaleX(-1);
 }
 
+/* opt5: hide raw camera feed — only show hand skeleton particles */
 #video {
-  object-fit: cover;
-  opacity: 0.55;
-  filter: saturate(0.7) contrast(1.05) brightness(0.9);
+  opacity: 0;
+  pointer-events: none;
 }
 
 /* ---------- Legend ---------- */

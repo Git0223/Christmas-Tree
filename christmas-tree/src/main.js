@@ -12,6 +12,7 @@ import '@fontsource/cormorant-garamond/500.css';
 import '@fontsource/jost/300.css';
 import '@fontsource/jost/400.css';
 import '@fontsource/jost/500.css';
+import { buildTextParticles, SEQUENCE } from './text.js';
 
 /* ------------------------------------------------------------------ */
 /*  Config                                                             */
@@ -163,6 +164,8 @@ canvas.addEventListener(
 /*  UI actions                                                         */
 /* ------------------------------------------------------------------ */
 
+let textTimerHandle = 0;
+
 setAssembled = function (next, announce = true) {
   assembled = next;
   targetProgress = next ? 1 : 0;
@@ -170,6 +173,13 @@ setAssembled = function (next, announce = true) {
   morphBtn.setAttribute('aria-pressed', String(next));
   if (announce && !gesture.active) {
     setStatus(next ? '聚合完成 · 静赏此刻' : '星屑散开 · 轻触聚合', next ? 'ok' : 'idle');
+  }
+  // opt6: tree assembled → schedule letter sequence
+  clearTimeout(textTimerHandle);
+  if (next && engine) {
+    textTimerHandle = setTimeout(() => {
+      if (assembled && engine.beginTextSequence) engine.beginTextSequence();
+    }, SEQUENCE.assembleDelayMs);
   }
 };
 
@@ -249,8 +259,17 @@ const gesture = {
   candidate: '',
   candidateCount: 0,
   stable: '',
-  palm: { x: 0.5, y: 0.5, ready: false },
-  pinchActive: false,
+  palm: { x: 0.5, y: 0.5, ready: false, area: 0, areaPrev: 0, areaDelta: 0, steadyMs: 0 },
+  // distance tracking — area-based zoom, near→close→enlarge / far→shrink
+  zoomAcc: 0,
+  zoomBaseDist: BASE_DIST,
+  // FPS monitor
+  lastFrameMs: performance.now(),
+  fpsSamples: [],
+  throttled: false,
+  // boot prefetch — kick off MediaPipe assets early
+  prefetchWasm: null,
+  prefetchModel: null,
 };
 
 let visionLib = null;
@@ -265,11 +284,12 @@ function resetHand() {
   gesture.candidate = '';
   gesture.candidateCount = 0;
   gesture.stable = '';
+  gesture.zoomAcc = 0;
   gesture.palm.ready = false;
-  if (gesture.pinchActive) {
-    gesture.pinchActive = false;
-    distTarget = BASE_DIST;
-  }
+  gesture.palm.area = 0;
+  gesture.palm.areaPrev = 0;
+  gesture.palm.areaDelta = 0;
+  gesture.palm.steadyMs = 0;
 }
 
 function updateHandPresence(present) {
@@ -301,7 +321,7 @@ const GESTURE_LABEL = {
   None: '未知',
 };
 
-function processResult(result) {
+function processResult(result, frameMs = performance.now()) {
   const hands = result.landmarks;
   if (!hands || hands.length === 0) {
     gesture.lostFrames++;
@@ -317,7 +337,46 @@ function processResult(result) {
 
   const lm = hands[0];
 
-  // Palm position → orbit
+  // --- Palm area-based zooming (opt2): near = enlarge / far = shrink ---
+  // Shoelace area over the 21 hand landmarks
+  let area = 0;
+  for (let i = 0; i < lm.length; i++) {
+    const a = lm[i];
+    const b = lm[(i + 1) % lm.length];
+    area += a.x * b.y - b.x * a.y;
+  }
+  area = Math.abs(area) * 0.5;
+
+  if (gesture.palm.area > 0) {
+    const delta = area - gesture.palm.area;
+    // Exponential accumulator — smooths jitter
+    gesture.palm.areaDelta = delta * 0.6 + gesture.palm.areaDelta * 0.4;
+
+    // Stability gate: only count zoom when the hand is fairly still.
+    // Track recent center-of-mass velocity.
+    let cx = 0, cy = 0;
+    for (const p of lm) { cx += p.x; cy += p.y; }
+    cx /= lm.length; cy /= lm.length;
+    const dxAbs = Math.abs(cx - gesture.palm.x);
+    const dyAbs = Math.abs(cy - gesture.palm.y);
+    const speed = dxAbs + dyAbs;
+
+    if (speed < 0.004) gesture.palm.steadyMs += 32; else gesture.palm.steadyMs = 0;
+
+    // Hard threshold: ignore tiny movements
+    const relDelta = Math.abs(gesture.palm.areaDelta) / gesture.palm.area;
+    if (relDelta > 0.055 && gesture.palm.steadyMs > 150) {
+      // area ↑ → hand near → camera closer → distTarget ↓ (enlarge frame)
+      // area ↓ → hand far → camera away  → distTarget ↑ (shrink frame)
+      const K = 140; // sensitivity
+      distTarget = clamp(distTarget - gesture.palm.areaDelta * K, 34, 105);
+      setStatus('手势 · 前后移动 — 调整远近', 'live');
+    }
+  }
+  gesture.palm.area = area;
+  gesture.palm.areaPrev = area;
+
+  // --- Palm position → orbit rotation ---
   const nx = 1 - lm[9].x;
   const ny = lm[9].y;
   if (!gesture.palm.ready) {
@@ -336,24 +395,7 @@ function processResult(result) {
     pitchTarget = clamp(pitchTarget + dy * 1.3, -0.3, 0.4);
   }
 
-  // Pinch → zoom
-  const fingerGap = Math.hypot(lm[8].x - lm[4].x, lm[8].y - lm[4].y);
-  const palmSize = Math.hypot(lm[9].x - lm[0].x, lm[9].y - lm[0].y) || 0.001;
-  const ratio = fingerGap / palmSize;
-  if (ratio < 0.62) {
-    gesture.pinchActive = true;
-    distTarget = clamp(
-      THREE.MathUtils.mapLinear(clamp(ratio, 0.12, 0.62), 0.12, 0.62, 36, BASE_DIST),
-      34,
-      BASE_DIST
-    );
-    setStatus('手势 · 捏合 — 拉近凝望', 'live');
-  } else if (gesture.pinchActive) {
-    gesture.pinchActive = false;
-    distTarget = BASE_DIST;
-  }
-
-  // Category gesture
+  // --- Category gesture (fist = assemble, palm = disperse) ---
   const g = result.gestures?.[0]?.[0];
   if (!g || g.score < 0.45) return;
 
@@ -367,15 +409,20 @@ function processResult(result) {
 
   if (gesture.candidateCount >= 3 && gesture.stable !== name) {
     gesture.stable = name;
-    if (name === 'Closed_Fist' || name === 'Open_Palm') applyGesture(name);
+    if (name === 'Closed_Fist') {
+      setAssembled(true, false);
+      setStatus('手势 · 握拳 — 聚合成树', 'live');
+    } else if (name === 'Open_Palm') {
+      setAssembled(false, false);
+      setStatus('手势 · 张开 — 星屑散开', 'live');
+    }
   }
 
   if (
     gesture.stable &&
     gesture.stable !== 'None' &&
     gesture.stable !== 'Closed_Fist' &&
-    gesture.stable !== 'Open_Palm' &&
-    !gesture.pinchActive
+    gesture.stable !== 'Open_Palm'
   ) {
     setStatus(`手势 · ${GESTURE_LABEL[gesture.stable] || gesture.stable}`, 'live');
   }
@@ -396,13 +443,13 @@ function drawSkeleton(result) {
 
   if (!gesture.drawing) gesture.drawing = new visionLib.DrawingUtils(ctx);
   gesture.drawing.drawConnectors(lm, HAND_CONNECTIONS, {
-    color: 'rgba(226, 190, 128, 0.9)',
-    lineWidth: 2,
+    color: 'rgba(242, 223, 178, 0.95)',
+    lineWidth: 2.2,
   });
   gesture.drawing.drawLandmarks(lm, {
-    color: 'rgba(255, 248, 232, 0.95)',
-    fillColor: 'rgba(194, 84, 91, 0.9)',
-    radius: 2,
+    color: 'rgba(255, 248, 232, 1)',
+    fillColor: 'rgba(255, 105, 110, 1)',
+    radius: 2.2,
   });
 }
 
@@ -410,16 +457,28 @@ function detectLoop() {
   if (!gesture.active) return;
   gesture.raf = requestAnimationFrame(detectLoop);
 
+  // opt4: FPS monitor — auto-degrade if device is under load
   const now = performance.now();
+  const frameMs = now - gesture.lastFrameMs;
+  gesture.lastFrameMs = now;
+  gesture.fpsSamples.push(frameMs);
+  if (gesture.fpsSamples.length > 120) gesture.fpsSamples.shift();
+
+  const detectInterval = gesture.throttled ? 48 : 32;
+  const minDelta = gesture.throttled ? 52 : 36;
+
   if (
     !videoEl.videoWidth ||
-    now - gesture.lastDetect < 32 ||
+    now - gesture.lastDetect < detectInterval ||
     videoEl.currentTime === gesture.lastVideoTime
   ) {
     return;
   }
   gesture.lastVideoTime = videoEl.currentTime;
   gesture.lastDetect = now;
+
+  // Throttle: sometimes also skip if the last frame took too long
+  if (frameMs > minDelta && gesture.throttled) return;
 
   let result;
   try {
@@ -429,7 +488,19 @@ function detectLoop() {
     return;
   }
   drawSkeleton(result);
-  processResult(result);
+  processResult(result, now);
+
+  // Evaluate throttle state roughly once a second
+  if (gesture.fpsSamples.length >= 45 && gesture.fpsSamples.length % 60 === 0) {
+    const avg = gesture.fpsSamples.reduce((s, v) => s + v, 0) / gesture.fpsSamples.length;
+    if (avg > 45 && !gesture.throttled) {
+      gesture.throttled = true;
+      setStatus('设备负载较高 · 识别已降级', 'warn');
+    } else if (avg < 35 && gesture.throttled) {
+      gesture.throttled = false;
+      setStatus('手势识别恢复正常', 'ok');
+    }
+  }
 }
 
 async function createRecognizer() {
@@ -447,12 +518,23 @@ async function createRecognizer() {
       minTrackingConfidence: 0.5,
     });
 
+  // Prefer CPU delegate — it initialises significantly faster than GPU fallback on most browsers
   try {
-    return await build('GPU');
+    return await build('CPU');
   } catch (err) {
-    console.warn('GPU delegate unavailable, falling back to CPU', err);
-    return build('CPU');
+    console.warn('CPU delegate unavailable, falling back to GPU', err);
+    return build('GPU');
   }
+}
+
+// opt3: prefetch MediaPipe assets so they land in HTTP cache before user clicks
+function prefetchMediaPipe() {
+  if (gesture.prefetchWasm) return;
+  const wasmUrl = `${BASE_URL}mediapipe/wasm/vision_wasm_internal.js`;
+  const modelUrl = `${BASE_URL}mediapipe/gesture_recognizer.task`;
+  // Fire-and-forget — just warm the browser connection pool / cache
+  gesture.prefetchWasm = fetch(wasmUrl, { cache: 'default' }).catch(() => {});
+  gesture.prefetchModel = fetch(modelUrl, { cache: 'default' }).catch(() => {});
 }
 
 function requestCamera(constraints, timeoutMs = 15000) {
@@ -491,6 +573,9 @@ async function startGestures() {
     return;
   }
 
+  // opt3: warm MediaPipe asset cache as early as possible
+  prefetchMediaPipe();
+
   gesture.loading = true;
   gestureBtn.textContent = '唤醒中…';
   gestureBtn.disabled = true;
@@ -515,6 +600,11 @@ async function startGestures() {
     gesture.stream = stream;
     videoEl.srcObject = stream;
     await videoEl.play().catch(() => {});
+
+    // opt4: reset FPS samples on a fresh session
+    gesture.lastFrameMs = performance.now();
+    gesture.fpsSamples.length = 0;
+    gesture.throttled = false;
 
     gesture.active = true;
     previewEl.hidden = false;
@@ -700,6 +790,7 @@ function createEngine() {
       attribute vec3 aChaos;
       attribute float aSize;
       attribute float aSeed;
+      attribute float aSag;
       attribute vec3 aColor;
       varying vec3 vColor;
       varying float vAlpha;
@@ -715,13 +806,17 @@ function createEngine() {
         pos.y += cos(uTime * 0.38 + aSeed * 13.0) * 0.8 * drift;
         pos.z += sin(uTime * 0.41 + aSeed * 11.0) * 0.9 * drift;
 
-        pos.x += sin(uTime * 0.85 + position.y * 0.32 + aSeed) * 0.1 * t;
+        // pine-needle droop — acts only on assembled tree
+        float wind = sin(uTime * 0.85 + position.y * 0.32 + aSeed) * 0.18;
+        float droop = aSag * 0.35 * sin(uTime * 0.35 + position.y * 0.15 + aSeed * 3.0);
+        pos.x += wind * t;
+        pos.z += droop * t;
 
         vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
         gl_Position = projectionMatrix * mvPosition;
 
         float twinkle = 0.72 + 0.28 * sin(uTime * (0.8 + aSeed * 2.2) + aSeed * 40.0);
-        gl_PointSize = aSize * uDpr * (1.18 - 0.18 * t) * (135.0 / -mvPosition.z);
+        gl_PointSize = aSize * uDpr * (1.12 - 0.12 * t) * (135.0 / -mvPosition.z);
 
         vColor = aColor * twinkle * 0.84;
         vAlpha = mix(0.46, 0.68, t);
@@ -846,20 +941,27 @@ function createEngine() {
     uniforms: {
       uTime: { value: 0 },
       uDpr: { value: DPR },
+      uRadius: { value: TREE.radius },
       uColor: { value: new THREE.Color('#d7ece4') },
     },
     vertexShader: /* glsl */ `
       uniform float uTime;
       uniform float uDpr;
+      uniform float uRadius;
       attribute float aSize;
       attribute float aSeed;
       varying float vAlpha;
 
       void main() {
         vec3 pos = position;
-        pos.y = mod(pos.y - uTime * (1.6 + aSeed * 2.6), 92.0) - 46.0;
-        pos.x += sin(uTime * 0.32 + aSeed * 22.0) * 2.2;
-        pos.z += cos(uTime * 0.26 + aSeed * 17.0) * 1.4;
+        float d2 = length(pos.xz);
+        float near = smoothstep(uRadius * 1.3, uRadius * 0.4, d2);
+        float fallMul = 1.0 - near * 0.35;
+        float windMul = 1.0 + near * 1.4;
+
+        pos.y = mod(pos.y - uTime * (1.6 + aSeed * 2.6) * fallMul, 92.0) - 46.0;
+        pos.x += sin(uTime * 0.32 + aSeed * 22.0 + pos.y * 0.05) * 2.2 * windMul;
+        pos.z += cos(uTime * 0.26 + aSeed * 17.0 + pos.y * 0.04) * 1.4 * windMul;
 
         vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
         gl_Position = projectionMatrix * mvPosition;
@@ -893,28 +995,32 @@ function createEngine() {
     const color = new Float32Array(count * 3);
     const size = new Float32Array(count);
     const seed = new Float32Array(count);
+    const sag = new Float32Array(count);   // for pine-needle droop
 
     const c = new THREE.Color();
     const H = TREE.height;
     const R = TREE.radius;
 
     for (let i = 0; i < count; i++) {
-      const t = Math.pow(rand(), 0.82);
+      const t = Math.pow(rand(), 0.78);                 // more particles in lower tiers
       const y = -H / 2 + t * H;
 
-      const profile = Math.pow(1 - t, 0.96);
-      const tier = 0.83 + 0.17 * Math.cos(((t * 9) % 1) * Math.PI * 2);
-      const shell = 0.56 + 0.44 * Math.pow(rand(), 0.38);
+      const profile = Math.pow(1 - t, 0.9);             // cone taper
+      // Sharp tier steps with rounded lobes
+      const tierBase = 0.72 + 0.28 * Math.sin(t * Math.PI * 8);
+      const tierSmooth = 0.88 + 0.12 * Math.cos(t * Math.PI * 1.5);
+      const tier = tierBase * tierSmooth;
+      const shell = 0.55 + 0.45 * Math.pow(rand(), 0.36);
       const radius = R * profile * tier * shell;
 
-      const theta = rand() * Math.PI * 2 + t * 7.5;
+      const theta = rand() * Math.PI * 2 + t * 8.2;
       tree[i * 3] = Math.cos(theta) * radius;
-      tree[i * 3 + 1] = y + (rand() - 0.5) * 0.5;
+      tree[i * 3 + 1] = y + (rand() - 0.5) * 0.45;
       tree[i * 3 + 2] = Math.sin(theta) * radius;
 
       const u = rand() * 2 - 1;
       const phi = rand() * Math.PI * 2;
-      const rr = 28 + Math.pow(rand(), 0.65) * 27;
+      const rr = 28 + Math.pow(rand(), 0.62) * 28;
       const s = Math.sqrt(1 - u * u);
       chaos[i * 3] = Math.cos(phi) * s * rr;
       chaos[i * 3 + 1] = u * rr * 0.72 + 1.5;
@@ -923,16 +1029,16 @@ function createEngine() {
       const r = rand();
       let hex;
       let sz;
-      if (r < 0.66) {
+      if (r < 0.58) {
         hex = '#0d5038';
-        sz = 1.05 + rand() * 1.35;
-      } else if (r < 0.865) {
+        sz = 1.05 + rand() * 1.25;
+      } else if (r < 0.8) {
         hex = '#1b7d5b';
         sz = 1.1 + rand() * 1.4;
-      } else if (r < 0.92) {
+      } else if (r < 0.9) {
         hex = '#8bd8b6';
         sz = 1.2 + rand() * 1.4;
-      } else if (r < 0.975) {
+      } else if (r < 0.965) {
         hex = '#e6c184';
         sz = 1.55 + rand() * 1.7;
       } else {
@@ -941,14 +1047,14 @@ function createEngine() {
       }
 
       c.set(hex);
-      if (rand() < 0.35) c.multiplyScalar(0.62 + rand() * 0.3);
+      if (rand() < 0.32) c.multiplyScalar(0.6 + rand() * 0.3);
       color[i * 3] = c.r;
       color[i * 3 + 1] = c.g;
       color[i * 3 + 2] = c.b;
 
-      // compensate the higher particle density near the apex
-      size[i] = sz * (0.52 + 0.48 * profile);
+      size[i] = sz * (0.48 + 0.52 * profile);
       seed[i] = rand();
+      sag[i] = 0.6 + 0.4 * Math.sin(t * Math.PI);     // droop: stronger at base
     }
 
     const geo = new THREE.BufferGeometry();
@@ -957,6 +1063,7 @@ function createEngine() {
     geo.setAttribute('aColor', new THREE.BufferAttribute(color, 3));
     geo.setAttribute('aSize', new THREE.BufferAttribute(size, 1));
     geo.setAttribute('aSeed', new THREE.BufferAttribute(seed, 1));
+    geo.setAttribute('aSag', new THREE.BufferAttribute(sag, 1));
 
     const points = new THREE.Points(geo, foliageMat);
     points.frustumCulled = false;
@@ -977,13 +1084,20 @@ function createEngine() {
     const R = TREE.radius;
 
     for (let i = 0; i < count; i++) {
-      const t = Math.pow(rand(), 0.9);
+      const t = Math.pow(rand(), 0.88);
       const y = -H / 2 + t * H;
-      const radius = R * Math.pow(1 - t, 0.95) * (0.94 + rand() * 0.12);
-      const theta = rand() * Math.PI * 2 + t * 7.5;
+      const profile = Math.pow(1 - t, 0.92);
 
+      // spiral along tree tiers — lights hug the outer edges of branches
+      const tierPhase = (t * 8) + rand() * 0.25;
+      const tier = 0.86 + 0.14 * Math.sin(tierPhase * Math.PI * 2);
+      const radial = 0.96 + rand() * 0.06;           // nearly hug shell
+      const radius = R * profile * tier * radial;
+
+      // tight helical wrap around the cone
+      const theta = rand() * Math.PI * 2 + t * 14 + (rand() - 0.5) * 0.35;
       tree[i * 3] = Math.cos(theta) * radius;
-      tree[i * 3 + 1] = y + (rand() - 0.5) * 0.8;
+      tree[i * 3 + 1] = y + (rand() - 0.5) * 0.4;
       tree[i * 3 + 2] = Math.sin(theta) * radius;
 
       const u = rand() * 2 - 1;
@@ -999,7 +1113,9 @@ function createEngine() {
       color[i * 3 + 1] = c.g;
       color[i * 3 + 2] = c.b;
 
-      size[i] = 2.7 + rand() * 2.6;
+      // slightly brighter near the top — fairy-light feel
+      const bright = 0.9 + 0.35 * profile;
+      size[i] = (2.4 + rand() * 2.6) * bright;
       seed[i] = rand();
     }
 
@@ -1126,6 +1242,59 @@ function createEngine() {
   const sky = buildSky();
   scene.add(sky);
 
+  /* ---- text particle overlay (opt6) ---- */
+  const textData = buildTextParticles(IS_MOBILE ? '圣诞快乐' : '圣诞快乐', {
+    fontSize: IS_MOBILE ? 24 : 34,
+    letterGap: 1.15,
+    centerY: -TREE.height / 2 - 5.4,
+    centerZ: 2.4,
+  });
+  scene.add(textData.group);
+  const letterProgresses = textData.progresses;
+
+  /* ---- letter-sequence scheduler (opt6) ---- */
+  let letterTimer = 0;
+  let letterStepTimer = 0;
+  let letterState = 'idle';    // 'idle' | 'assembling' | 'holding' | 'dispersing'
+  let letterIndex = 0;
+
+  function beginTextSequence() {
+    if (letterState === 'assembling') return;
+    // 清除旧的并从头开始
+    for (let i = 0; i < letterProgresses.length; i++) letterProgresses[i] = 0;
+    letterIndex = 0;
+    letterState = 'assembling';
+    clearTimeout(letterTimer);
+    clearTimeout(letterStepTimer);
+    letterStepTimer = setTimeout(stepLetter, 60);
+  }
+  function stepLetter() {
+    if (letterState !== 'assembling') return;
+    // 下一个字开始 lerp 到 1
+    if (letterIndex < letterProgresses.length && textData.group.children[letterIndex]) {
+      letterProgresses[letterIndex] = 0.01; // 标记已激活，animate 里平滑推进
+      letterIndex++;
+      letterStepTimer = setTimeout(stepLetter, SEQUENCE.perLetterInMs);
+    } else {
+      letterState = 'holding';
+      letterTimer = setTimeout(beginTextDisperse, SEQUENCE.holdMs);
+    }
+  }
+  function beginTextDisperse() {
+    letterState = 'dispersing';
+    clearTimeout(letterStepTimer);
+  }
+  function stepLetterOut(dt) {
+    // animate 里调：每个已激活字 lerp 回 0
+    for (let i = 0; i < letterProgresses.length; i++) {
+      if (letterProgresses[i] > 0) {
+        letterProgresses[i] = Math.max(0, letterProgresses[i] - dt * 3.0);
+      }
+    }
+    const allDone = letterProgresses.every((v) => v <= 0);
+    if (allDone) letterState = 'idle';
+  }
+
   /* ---- loop ----------------------------------------------------- */
 
   const clock = new THREE.Clock();
@@ -1179,6 +1348,32 @@ function createEngine() {
     groundGlow.material.opacity = 0.16 + progress * 0.14;
     backdropHalo.material.opacity = 0.09 + progress * 0.09;
 
+    // ---- text letter progress (opt6) ----
+    if (letterState === 'assembling') {
+      for (let i = 0; i < letterProgresses.length; i++) {
+        if (letterProgresses[i] > 0 && letterProgresses[i] < 1) {
+          letterProgresses[i] = Math.min(1, letterProgresses[i] + dt * 1.8);
+        }
+      }
+    } else if (letterState === 'dispersing') {
+      stepLetterOut(dt);
+    }
+    for (let i = 0; i < textData.group.children.length; i++) {
+      const p = textData.group.children[i];
+      if (p?.material?.uniforms) {
+        p.material.uniforms.uTime.value = t;
+        p.material.uniforms.uProgress.value = letterProgresses[i] ?? 0;
+        p.material.uniforms.uDpr.value = DPR;
+      }
+    }
+    // 文本跟随树的旋转，且完全消失时整体隐藏避免浪费 GPU
+    const textAlive = letterProgresses.some((v) => v > 0.01);
+    textData.group.visible = textAlive;
+    if (textAlive) {
+      textData.group.rotation.y = yaw;
+      textData.group.rotation.x = pitch * 0.6;
+    }
+
     composer.render();
   }
 
@@ -1194,7 +1389,7 @@ function createEngine() {
 
   renderer.setAnimationLoop(animate);
 
-  return { resize };
+  return { resize, beginTextSequence };
 }
 
 /* ------------------------------------------------------------------ */
