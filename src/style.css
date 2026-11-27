@@ -175,12 +175,8 @@ body.is-live .hud {
   display: inline-flex;
   align-items: center;
   gap: 13px;
-  cursor: pointer;
-  text-decoration: none;
   color: inherit;
-  transition: opacity 0.25s ease;
 }
-.brand:hover { opacity: 0.78; }
 
 .brand__mark {
   color: var(--gold);

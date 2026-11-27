@@ -33,7 +33,7 @@
     <div class="grain" aria-hidden="true"></div>
 
     <header class="hud hud--top">
-      <a class="brand" href="#intro" id="brandHome" aria-label="回到首页">
+      <div class="brand">
         <span class="brand__mark" aria-hidden="true">
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none">
             <path
@@ -48,11 +48,11 @@
           <span class="brand__name">NOËLI</span>
           <span class="brand__sub">PARTICLE TREE · GESTURE</span>
         </span>
-      </a>
+      </div>
 
       <div class="status" id="status" data-tone="idle" role="status" aria-live="polite">
         <span class="status__dot" aria-hidden="true"></span>
-        <span class="status__text" id="statusText">系统待命</span>
+        <span class="status__text" id="statusText">正在加载手势模型</span>
       </div>
     </header>
 
@@ -160,13 +160,9 @@
           两万余粒微光，在冬夜里聚成一棵树。<br />
           举起手，让星光随你的手势聚合、散开与流转；握拳拉近，祝福便逐字化作光。
         </p>
-        <div class="cta">
-          <button class="btn btn--gold" id="enterGesture" type="button">开启手势，进入</button>
-          <button class="btn btn--ghost" id="enterQuiet" type="button">静赏</button>
-        </div>
         <p class="hint">
           <span class="hint__dot"></span>
-          需允许摄像头权限 · 手势在本地识别 · 画面可拖动旋转
+          正在自动开启摄像头与手势识别 · 请在弹窗中允许访问
         </p>
       </div>
       <p class="intro__foot">HAND GESTURE · PARTICLE TREE</p>

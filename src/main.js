@@ -54,10 +54,6 @@ const morphBtn = document.getElementById('morphBtn');
 const immersiveBtn = document.getElementById('immersiveBtn');
 const enterGestureBtn = document.getElementById('enterGesture');
 const enterQuietBtn = document.getElementById('enterQuiet');
-const composerEl = document.getElementById('composer');
-const textInput = document.getElementById('textInput');
-const textSendBtn = document.getElementById('textSend');
-const textCount = document.getElementById('textCount');
 
 function setStatus(text, tone = 'idle') {
   statusText.textContent = text;
@@ -188,19 +184,19 @@ function enter(withGesture) {
   if (entered) return;
   entered = true;
   document.body.classList.add('is-live');
-  intro.classList.add('is-gone');
-  setTimeout(() => {
-    intro.hidden = true;
-  }, 1400);
+  if (intro) {
+    intro.classList.add('is-gone');
+    setTimeout(() => {
+      intro.hidden = true;
+    }, 900);
+  }
 
   // 散开态起步：phase='idle'，progressTarget=0
   setPhase('idle', '欢迎进入');
   targetProgress = 0;
   assembled = false;
   distTarget = START_DIST;
-  dist = START_DIST;
   yawTarget = 0;
-  camXTarget = 0;
 
   if (!engine) {
     setStatus('此浏览器未启用 WebGL', 'warn');
@@ -210,7 +206,6 @@ function enter(withGesture) {
   setStatus('试试握拳 → 让星光聚合', 'ok');
 
   if (withGesture) startGestures();
-  else setStatus('试试握拳 → 让星光聚合', 'ok');
 }
 
 morphBtn.addEventListener('click', () => {
@@ -221,22 +216,6 @@ morphBtn.addEventListener('click', () => {
   } else {
     setPhase('disperse', '手动散开');
   }
-});
-
-/* ---------- 品牌点击 → 回到首页 ---------- */
-const brandHome = document.getElementById('brandHome');
-brandHome?.addEventListener('click', (e) => {
-  e.preventDefault();
-  // 停止手势、退出沉浸、重置一切
-  if (gesture.active) stopGestures();
-  setImmersive(false);
-  setPhase('idle', '回到首页');
-  targetProgress = 0;
-  setAssembled(false, false);
-  if (engine && engine.clearText) engine.clearText();
-  introEl.classList.remove('is-hidden');
-  document.body.classList.remove('is-live');
-  location.hash = '';
 });
 
 /* ---------- 摄像头小窗：骨架 / 真实镜头 切换 ---------- */
@@ -257,37 +236,7 @@ toggleRaw?.addEventListener('click', () => {
   toggleSkeleton.setAttribute('aria-selected', 'false');
 });
 
-/* ---- custom text → particle showcase ---- */
-function submitText() {
-  const raw = [...(textInput.value || '')].slice(0, MAX_TEXT_LEN).join('').trim();
-  if (!raw) {
-    toast('先写一句想展示的话，最多 8 个字');
-    textInput.focus();
-    return;
-  }
-  if (!engine) {
-    toast('当前浏览器未启用 WebGL，文字粒子不可用');
-    return;
-  }
-  if (!entered) enter(false);
-  if (!assembled) setAssembled(true, false, false);
-  engine.playText(raw);
-  setStatus(`文字 ·「${raw}」正在逐字聚成`, 'ok');
-}
-
-composerEl?.addEventListener('submit', (e) => {
-  e.preventDefault();
-  submitText();
-});
-
-textInput?.addEventListener('input', () => {
-  const chars = [...textInput.value];
-  if (chars.length > MAX_TEXT_LEN) {
-    textInput.value = chars.slice(0, MAX_TEXT_LEN).join('');
-  }
-  textCount.textContent = `${[...textInput.value].length}/${MAX_TEXT_LEN}`;
-});
-
+/* ---- 自动进入：打开页面即加载模型并开启手势 ---- */
 immersiveBtn.addEventListener('click', () =>
   setImmersive(!document.body.classList.contains('is-immersive'))
 );
@@ -298,8 +247,8 @@ gestureBtn.addEventListener('click', () => {
   else startGestures();
 });
 
-enterGestureBtn.addEventListener('click', () => enter(true));
-enterQuietBtn.addEventListener('click', () => enter(false));
+enterGestureBtn?.addEventListener('click', () => enter(true));
+enterQuietBtn?.addEventListener('click', () => enter(true));
 
 window.addEventListener('keydown', (e) => {
   if (e.code === 'Escape') setImmersive(false);
@@ -369,6 +318,8 @@ function resetHand() {
   gesture.palm.ready = false;
   gesture.palm.spanSlow = 0;
   gesture.palm.spanFast = 0;
+  swipePrevX = null;
+  prevFistX = null;
 }
 
 function updateHandPresence(present) {
@@ -415,6 +366,35 @@ const GESTURE_LABEL = {
   None: '未知',
 };
 
+/* 并指（食指+中指）识别与左右滑动 */
+let swipePrevX = null;
+let prevFistX = null;
+
+function detectTwoFingerSwipe(lm) {
+  const extIndex = lm[8].y < lm[6].y - 0.012;
+  const extMiddle = lm[12].y < lm[10].y - 0.012;
+  const extRing = lm[16].y < lm[14].y - 0.008;
+  const gap = Math.hypot(lm[8].x - lm[12].x, lm[8].y - lm[12].y);
+
+  const isTwo = extIndex && extMiddle && !extRing && gap < 0.085;
+  if (!isTwo) {
+    swipePrevX = null;
+    return false;
+  }
+
+  const fx = (lm[8].x + lm[12].x) / 2;
+  if (swipePrevX !== null) {
+    const dx = fx - swipePrevX;
+    if (Math.abs(dx) > 0.0015) {
+      // 画面是镜像的：手向右移 → landmark x 变小 → dx<0 → yaw 正向
+      yawTarget -= dx * 9.0;
+      setStatus('并指滑动 · 旋转视角', 'live');
+    }
+  }
+  swipePrevX = fx;
+  return true;
+}
+
 function processResult(result, frameMs = performance.now()) {
   const hands = result.landmarks;
   if (!hands || hands.length === 0) {
@@ -448,6 +428,9 @@ function processResult(result, frameMs = performance.now()) {
 
   const spread = fingerSpread(lm);
   const span = palmSpan(lm);
+
+  // ---- 并指（食指+中指）左右滑动 → 旋转（所有 phase 生效）----
+  const twoFingerSwipe = detectTwoFingerSwipe(lm);
 
   // ---- 手掌中心 → 旋转（所有 phase 都生效）----
   const nx = 1 - lm[9].x;
@@ -488,20 +471,10 @@ function processResult(result, frameMs = performance.now()) {
  * - 握拳 → setPhase('tree')
  */
 function phaseIdle(spread, stable, prevStable, palm) {
-  // 并指左右滑判定：食指中指距离较大（> 0.08）且稳定
-  if (spread > 0.09 && stable !== 'Closed_Fist') {
-    const dx = palm.x - (palm.x); // palm.x 已经是平滑值，用增量
-    // 直接赋值会跳，这里做个幅度
-    yawTarget += (dx * 0.45) * (spread * 5.5);
-    // 但要注意 palm.x 自己也在累加——换一种更直接的方式
-    // 重新算：直接用 palm.x 作为 yawTarget 的偏移（归一化到 ±0.8）
-    const target = (palm.x - 0.5) * 1.6;
-    yawTarget = THREE.MathUtils.clamp(yawTarget * 0.72 + target * 0.28, -Math.PI * 3, Math.PI * 3);
-  }
-
+  // 并指左右滑由全局手势处理（twoFingerSwipe），这里只负责握拳聚合
   if (stable === 'Closed_Fist') {
     setPhase('tree', '检测到握拳');
-    setAssembled(true, false, false); // 树成形但暂不触发文字
+    setAssembled(true, false);
   }
 }
 
@@ -511,20 +484,27 @@ function phaseIdle(spread, stable, prevStable, palm) {
  * - 拳头继续移动 → yawTarget 跟随（rotate）
  */
 function phaseTree(stable, prevStable, palm, transitionMs) {
-  // 握拳带转
   if (stable === 'Closed_Fist') {
-    const dx = palm.x - 0.5;
-    yawTarget += dx * 0.12;
+    // 握拳带转：跟随拳头位移增量（静止时不漂移）
+    if (prevFistX !== null) {
+      const dx = palm.x - prevFistX;
+      if (Math.abs(dx) > 0.0015) {
+        yawTarget += dx * 7.5 + dx * Math.abs(dx) * 60; // 甩得越快，冲量越大
+      }
+    }
+    prevFistX = palm.x;
 
-    // 拳头缩小 → 拉近
+    // 拳头突然缩小 → 拉近
     const ratio = palm.spanFast / palm.spanSlow;
     if (ratio < 0.9 && palm.spanSlow > 0.03) {
       setPhase('pull', `握拳缩小 ${ratio.toFixed(2)}`);
-      distTarget = 50;
+      distTarget = 48;
     }
+  } else {
+    prevFistX = null;
   }
 
-  // Closed_Fist → Open_Palm 明显过程（过渡时间足够长，score 有明显下降）
+  // Closed_Fist → Open_Palm 明显过程（过渡时间足够长）
   if (prevStable === 'Closed_Fist' && stable === 'Open_Palm' && transitionMs > 120) {
     setPhase('disperse', '握拳→张开 过渡');
   }
@@ -535,14 +515,6 @@ function phaseTree(stable, prevStable, palm, transitionMs) {
  * - Closed_Fist → Open_Palm → disperse（同样要过渡足够长）
  */
 function phaseHold(spread, stable, prevStable) {
-  if (spread > 0.09) {
-    // 平滑带方向
-    const target = (spread > 0.12 ? 1 : 0); // 简化：spread 大说明张开了
-    void target;
-    // 简化：直接让 yawTarget 左右扫
-    yawTarget += (stable === 'Pointing_Up' || spread > 0.11 ? 1 : 0) * 0.02;
-  }
-
   if (prevStable === 'Closed_Fist' && stable === 'Open_Palm' && gesture.transitionSince > 160) {
     setPhase('disperse', 'hold 态握拳→张开');
   }
@@ -1393,7 +1365,6 @@ function createEngine() {
   scene.add(sky);
 
   /* ---- text particle overlay (opt6) ---- */
-  const DEFAULT_TEXT = '圣诞快乐';
   let textData = { group: new THREE.Group(), items: [] };
   scene.add(textData.group);
 
@@ -1410,9 +1381,11 @@ function createEngine() {
     try {
       disposeText();
       textData = buildTextParticles(text, {
-        scale: IS_MOBILE ? 0.1 : 0.118,
-        letterGap: 0.22,
-        centerY: IS_MOBILE ? 0.6 : 1.1,
+        scale: IS_MOBILE ? 0.034 : 0.038,
+        letterGap: 0.16,
+        lineGap: IS_MOBILE ? 2.2 : 2.9,
+        centerX: IS_MOBILE ? 0 : 11.0,
+        centerY: IS_MOBILE ? 0.6 : 1.2,
         centerZ: 17,
       });
       scene.add(textData.group);
@@ -1504,8 +1477,8 @@ function createEngine() {
   let yaw = yawTarget;
   let pitch = pitchTarget;
   let dist = START_DIST;
-  let camX = 0;
-  let camXTarget = 0;
+  let treeShiftX = 0;
+  let treeShiftTarget = 0;
   let pullTimer = 0;
   let disperseTimer = 0;
   let idleSince = null;
@@ -1558,9 +1531,8 @@ function createEngine() {
 
     // ---- phase: pull → 拉近 + 自动过 hold ----
     if (phase === 'pull') {
-      distTarget = 38; // 拉近到 38（平时 BASE_DIST≈72）
-      // 树也轻微往左偏（"靠左一点点"的感觉）—— 简单做法：相机 x 偏移
-      camXTarget = -1.6;
+      distTarget = 48; // 拉近
+      treeShiftTarget = -8; // 树整体左移，右侧留给祝福语
       // 自动推进：文字触发 + 计时 → hold
       if (!pullTimer) {
         pullTimer = 0;
@@ -1600,7 +1572,7 @@ function createEngine() {
       yawTarget *= Math.exp(-dt * 0.4);
       // 相机拉远
       distTarget = BASE_DIST;
-      camXTarget = 0;
+      treeShiftTarget = 0;
       progressTarget = 0; // 树崩散
       // 约 1.4s 后回到 idle
       if (disperseTimer > 1.4) {
@@ -1638,9 +1610,10 @@ function createEngine() {
     treeGroup.rotation.x = pitch;
 
     dist += (distTarget - dist) * (1 - Math.exp(-2.2 * dt));
-    camX += (camXTarget - camX) * (1 - Math.exp(-3.2 * dt));
-    camera.position.set(camX, 3.6 + Math.sin(t * 0.24) * 0.35, dist);
-    camera.lookAt(camX * 0.2, 1.2 + progress * 1.4, 0);
+    treeShiftX += (treeShiftTarget - treeShiftX) * (1 - Math.exp(-3.2 * dt));
+    treeGroup.position.x = treeShiftX;
+    camera.position.set(0, 3.6 + Math.sin(t * 0.24) * 0.35, dist);
+    camera.lookAt(0, 1.2 + progress * 1.4, 0);
 
     sky.rotation.y = t * 0.008;
     snow.rotation.y = Math.sin(t * 0.05) * 0.06;
@@ -1671,6 +1644,15 @@ function createEngine() {
     foliageMat.uniforms.uDim.value = dim;
     lightsMat.uniforms.uDim.value = dim;
     textData.group.visible = textAlive && phase !== 'disperse';
+    if (phase === 'disperse') {
+      // 文字粒子向树心汇入
+      const k = 1 - Math.min(1, dt * 2.6);
+      textData.group.position.x *= k;
+      textData.group.position.y *= k;
+      textData.group.position.z *= k;
+    } else if (textData.group.position.lengthSq() > 0.0001) {
+      textData.group.position.set(0, 0, 0);
+    }
     if (textAlive) {
       textData.group.rotation.y = Math.sin(t * 0.35) * 0.05 + textDriftX * 0.1;
       textData.group.rotation.x = Math.sin(t * 0.27) * 0.02 + textDriftY * 0.05;
@@ -1700,8 +1682,13 @@ function createEngine() {
 
 setAssembled(false, false);
 
+// 打开页面就开始预热手势模型（不等待点击）
+prefetchMediaPipe();
+
 try {
   engine = createEngine();
+  // 自动进入并开启手势：边看粒子边加载模型
+  setTimeout(() => enter(true), 120);
 } catch (err) {
   console.warn('WebGL unavailable', err);
   document.body.classList.add('no-webgl');
@@ -1709,8 +1696,8 @@ try {
   setStatus('当前浏览器未启用 WebGL', 'warn');
   gestureBtn.hidden = true;
   morphBtn.hidden = true;
-  enterGestureBtn.hidden = true;
-  enterQuietBtn.textContent = '进入';
+  if (enterGestureBtn) enterGestureBtn.hidden = true;
+  if (enterQuietBtn) enterQuietBtn.hidden = true;
 }
 
 window.addEventListener('resize', () => engine?.resize());
