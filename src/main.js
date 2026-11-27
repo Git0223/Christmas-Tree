@@ -248,7 +248,7 @@ gestureBtn.addEventListener('click', () => {
 });
 
 enterGestureBtn?.addEventListener('click', () => enter(true));
-enterQuietBtn?.addEventListener('click', () => enter(true));
+enterQuietBtn?.addEventListener('click', () => enter(false));
 
 window.addEventListener('keydown', (e) => {
   if (e.code === 'Escape') setImmersive(false);
@@ -320,6 +320,7 @@ function resetHand() {
   gesture.palm.spanFast = 0;
   swipePrevX = null;
   prevFistX = null;
+  fistHoldMs = 0;
 }
 
 function updateHandPresence(present) {
@@ -333,6 +334,7 @@ function updateHandPresence(present) {
 function setPhase(next, reason = '') {
   if (next === phaseTarget) return;
   phaseTarget = next;
+  document.body.classList.toggle('focus-text', next === 'pull' || next === 'hold');
   setStatus(`相位 → ${next} · ${reason}`, 'live');
 }
 
@@ -369,6 +371,7 @@ const GESTURE_LABEL = {
 /* 并指（食指+中指）识别与左右滑动 */
 let swipePrevX = null;
 let prevFistX = null;
+let fistHoldMs = 0;
 
 function detectTwoFingerSwipe(lm) {
   const extIndex = lm[8].y < lm[6].y - 0.012;
@@ -494,14 +497,16 @@ function phaseTree(stable, prevStable, palm, transitionMs) {
     }
     prevFistX = palm.x;
 
-    // 拳头突然缩小 → 拉近
+    // 拳头突然缩小 → 拉近（阈值放宽，避免有时触发不了）
     const ratio = palm.spanFast / palm.spanSlow;
-    if (ratio < 0.9 && palm.spanSlow > 0.03) {
-      setPhase('pull', `握拳缩小 ${ratio.toFixed(2)}`);
+    fistHoldMs += 33;
+    if ((ratio < 0.94 && palm.spanSlow > 0.03) || fistHoldMs > 3200) {
+      setPhase('pull', ratio < 0.94 ? `握拳缩小 ${ratio.toFixed(2)}` : '握拳保持');
       distTarget = 48;
     }
   } else {
     prevFistX = null;
+    fistHoldMs = 0;
   }
 
   // Closed_Fist → Open_Palm 明显过程（过渡时间足够长）
@@ -618,6 +623,23 @@ async function createRecognizer() {
   }
 }
 
+// 首界面停留时就把模型真正装载好（不只是缓存文件），进入后几乎秒开
+let recognizerWarm = null;
+function warmRecognizer() {
+  if (!recognizerWarm) {
+    recognizerWarm = createRecognizer()
+      .then((r) => {
+        gesture.recognizer = r;
+        return r;
+      })
+      .catch((err) => {
+        recognizerWarm = null;
+        throw err;
+      });
+  }
+  return recognizerWarm;
+}
+
 // opt3: prefetch MediaPipe assets so they land in HTTP cache before user clicks
 function prefetchMediaPipe() {
   if (gesture.prefetchWasm) return;
@@ -679,7 +701,7 @@ async function startGestures() {
 
     if (!gesture.recognizer) {
       setStatus('载入手势模型 · 首次稍慢', 'idle');
-      gesture.recognizer = await createRecognizer();
+      gesture.recognizer = await warmRecognizer();
     }
 
     setStatus('正在请求摄像头权限', 'idle');
@@ -1381,11 +1403,11 @@ function createEngine() {
     try {
       disposeText();
       textData = buildTextParticles(text, {
-        scale: IS_MOBILE ? 0.034 : 0.038,
-        letterGap: 0.16,
-        lineGap: IS_MOBILE ? 2.2 : 2.9,
-        centerX: IS_MOBILE ? 0 : 11.0,
-        centerY: IS_MOBILE ? 0.6 : 1.2,
+        scale: IS_MOBILE ? 0.02 : 0.022,
+        letterGap: 0.05,
+        lineGap: IS_MOBILE ? 2.0 : 2.6,
+        centerX: IS_MOBILE ? 0 : 12.5,
+        centerY: IS_MOBILE ? 0.4 : 1.2,
         centerZ: 17,
       });
       scene.add(textData.group);
@@ -1400,23 +1422,30 @@ function createEngine() {
   buildText(DEFAULT_TEXT);
 
   /* ---- letter-sequence scheduler (opt6) ---- */
-  let textState = 'idle'; // 'waiting' | 'in' | 'hold' | 'out'
-  let textIndex = 0;
+  let textState = 'idle'; // 'waiting' | 'in' | 'hold' | 'out' | 'idle'
   let textClock = 0;
   let textDelay = 0;
-  let textSteps = [];
+  let textStarts = [];
 
   function playText(text) {
     if (typeof text === 'string' && text.trim()) buildText(text.trim());
-    // 根据每个字符的语言算各自 step：英文字母快，中文字慢
-    textSteps = textData.raw.map((ch) => {
+    // 每个字的入场时刻：英文密一点，中文慢一点
+    textStarts = [];
+    let acc = 0;
+    for (let i = 0; i < textData.items.length; i++) {
+      const ch = textData.raw[i] || ' ';
       const c = ch.charCodeAt(0);
       const en = (c >= 0x0020 && c <= 0x007e) || (c >= 0x00a0 && c <= 0x024f);
-      return en ? SEQUENCE.enStep : SEQUENCE.zhStep;
+      textStarts.push(acc);
+      acc += en ? SEQUENCE.enStep : SEQUENCE.zhStep;
+    }
+    textData.items.forEach((it) => {
+      it.progress = 0;
+      it.scatter = 0;
+      it.started = false;
     });
-    textIndex = 0;
     textClock = 0;
-    textDelay = 0.35;
+    textDelay = 0.3;
     textState = 'waiting';
   }
 
@@ -1425,45 +1454,54 @@ function createEngine() {
   }
 
   function tickText(dt) {
+    const slam = SEQUENCE.slamMs / 1000;
+
     if (textState === 'waiting') {
       textDelay -= dt;
       if (textDelay <= 0) {
         textState = 'in';
         textClock = 0;
       }
-    } else if (textState === 'in') {
+      return;
+    }
+
+    if (textState === 'in') {
       textClock += dt;
-      // 按每个字的 step 间隔推进
-      let want = 0;
-      let acc = 0;
+      let allIn = true;
       for (let i = 0; i < textData.items.length; i++) {
-        acc += (textSteps && textSteps[i]) || 0.25;
-        if (acc <= textClock) want = i + 1;
-        else break;
-      }
-      want = Math.min(textData.items.length, want);
-      while (textIndex < want) {
-        textData.items[textIndex].progress = Math.max(textData.items[textIndex].progress, 0.001);
-        textIndex++;
-      }
-      let allIn = textIndex >= textData.items.length;
-      for (let i = 0; i < textIndex; i++) {
         const it = textData.items[i];
-        it.progress = Math.min(1, it.progress + dt * SEQUENCE.morphSpeed);
-        if (it.progress < 0.999) allIn = false;
+        const t0 = textStarts[i] ?? 0;
+        if (textClock < t0) {
+          allIn = false;
+          continue;
+        }
+        const k = Math.min(1, (textClock - t0) / slam);
+        // 过冲：0→1 过程中最多冲到 ~1.12，再回落到 1，形成“啪”的落位
+        const c1 = 1.70158;
+        const c3 = c1 + 1;
+        const shifted = k - 1;
+        it.progress = 1 + c3 * shifted * shifted * shifted + c1 * shifted * shifted;
+        if (k >= 1) it.progress = 1;
+        else allIn = false;
       }
       if (allIn) {
         textState = 'hold';
         textClock = 0;
       }
-    } else if (textState === 'hold') {
+      return;
+    }
+
+    if (textState === 'hold') {
       textClock += dt;
       if (textClock * 1000 >= SEQUENCE.holdMs) textState = 'out';
-    } else if (textState === 'out') {
+      return;
+    }
+
+    if (textState === 'out') {
       let allOut = true;
       for (const it of textData.items) {
-        it.progress = Math.max(0, it.progress - dt * SEQUENCE.letterOutSpeed);
-        if (it.progress > 0) allOut = false;
+        it.scatter = Math.min(1, it.scatter + dt * SEQUENCE.scatterSpeed);
+        if (it.scatter < 1) allOut = false;
       }
       if (allOut) textState = 'idle';
     }
@@ -1508,6 +1546,9 @@ function createEngine() {
     // 每 phase 的动画目标 & 自动推进
     let autoPhase = null;
     if (phase === 'tree') {
+      // 重新聚合时必须回到“未拉近”的居中树
+      distTarget = BASE_DIST;
+      treeShiftTarget = 0;
       // 没手 → 慢慢自转而减速（yawTarget 先猛拉到一个新值再自然回落）
       if (!gesture.present) {
         // 无手保持约 3.5s 后自动开始自转再慢慢减速
@@ -1532,7 +1573,7 @@ function createEngine() {
     // ---- phase: pull → 拉近 + 自动过 hold ----
     if (phase === 'pull') {
       distTarget = 48; // 拉近
-      treeShiftTarget = -8; // 树整体左移，右侧留给祝福语
+      treeShiftTarget = -13; // 树整体左移，右侧留给祝福语
       // 自动推进：文字触发 + 计时 → hold
       if (!pullTimer) {
         pullTimer = 0;
@@ -1635,15 +1676,16 @@ function createEngine() {
       const it = textData.items[i];
       it.material.uniforms.uTime.value = t;
       it.material.uniforms.uProgress.value = it.progress;
+      it.material.uniforms.uScatter.value = it.scatter;
       it.material.uniforms.uDpr.value = DPR;
-      if (it.progress > maxProg) maxProg = it.progress;
-      if (it.progress > 0.005) textAlive = true;
+      if (it.progress > 0.02) maxProg = Math.max(maxProg, Math.min(1, it.progress));
+      if (it.progress > 0.02 || it.scatter > 0.001) textAlive = true;
     }
-    if (textData.veil) textData.veil.material.opacity = phase === 'disperse' ? 0 : Math.min(1, maxProg) * 0.88;
-    const dim = 1 - Math.min(1, maxProg) * 0.22;
+    // 文字出现时只轻微压暗树，避免盖住金属光泽（不再有背景板）
+    const dim = 1 - Math.min(1, maxProg) * 0.2;
     foliageMat.uniforms.uDim.value = dim;
     lightsMat.uniforms.uDim.value = dim;
-    textData.group.visible = textAlive && phase !== 'disperse';
+    textData.group.visible = textAlive;
     if (phase === 'disperse') {
       // 文字粒子向树心汇入
       const k = 1 - Math.min(1, dt * 2.6);
@@ -1682,13 +1724,14 @@ function createEngine() {
 
 setAssembled(false, false);
 
-// 打开页面就开始预热手势模型（不等待点击）
+// 打开页面就在后台预加载模型（首界面保留，等待用户点击进入）
 prefetchMediaPipe();
+warmRecognizer().catch((err) => {
+  console.warn('Gesture model preload failed', err);
+});
 
 try {
   engine = createEngine();
-  // 自动进入并开启手势：边看粒子边加载模型
-  setTimeout(() => enter(true), 120);
 } catch (err) {
   console.warn('WebGL unavailable', err);
   document.body.classList.add('no-webgl');
