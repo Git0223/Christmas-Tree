@@ -1407,15 +1407,21 @@ function createEngine() {
   }
 
   function buildText(text) {
-    disposeText();
-    textData = buildTextParticles(text, {
-      fontPx: IS_MOBILE ? 32 : 44,
-      scale: IS_MOBILE ? 0.1 : 0.118,
-      letterGap: 0.22,
-      centerY: IS_MOBILE ? 0.6 : 1.1,
-      centerZ: 17,
-    });
-    scene.add(textData.group);
+    try {
+      disposeText();
+      textData = buildTextParticles(text, {
+        scale: IS_MOBILE ? 0.1 : 0.118,
+        letterGap: 0.22,
+        centerY: IS_MOBILE ? 0.6 : 1.1,
+        centerZ: 17,
+      });
+      scene.add(textData.group);
+    } catch (err) {
+      // 文字层只是装饰，绝不能让整站降级为“未启用 WebGL”
+      console.warn('[text] build failed', err);
+      textData = { group: new THREE.Group(), items: [], raw: [] };
+      scene.add(textData.group);
+    }
   }
 
   buildText(DEFAULT_TEXT);

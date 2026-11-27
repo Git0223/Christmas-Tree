@@ -125,16 +125,19 @@ export function buildTextParticles(text, opts = {}) {
   const c = new THREE.Color();
 
   let yCursor = centerY + ((lines.length - 1) * (zhFontPx * scale + lineGap * scale)) / 2;
+  const rawChars = [];
 
   for (const line of layout) {
     const lineChars = [...line.lineChars];
     const half = totalWidth / 2;
     for (let i = 0; i < lineChars.length; i++) {
       const ch = lineChars[i];
+      if (ch.trim() === '') continue; // 空格不生成粒子
       const isEn = isEnglishChar(ch);
       const fontPx = isEn ? enFontPx : zhFontPx;
       const px = rasterizeChar(ch, fontPx, scale);
       if (px.length < 30) continue;
+      rawChars.push(ch);
 
       const n = px.length;
       const target = new Float32Array(n * 3);
@@ -251,7 +254,7 @@ export function buildTextParticles(text, opts = {}) {
   veil.position.set(0, centerY - zhFontPx * scale * 0.2, centerZ - 2.4);
   group.add(veil);
 
-  return { group, items, veil, raw: chars };
+  return { group, items, veil, raw: rawChars };
 }
 
 /** 默认固定的两行文案 */
